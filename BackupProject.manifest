@@ -1,0 +1,13 @@
+{
+	"autodeskProduct":	"Fusion",
+	"type":	"addin",
+	"author":	"MaestroFusion360",
+	"description":	{
+		"":	"BackupProject for Fusion 360 automatically creates secure, organized backups of your design projects to ensure reliable version protection and quick recovery"
+	},
+	"version":	"0.1.0",
+	"runOnStartup":	false,
+	"supportedOS":	"windows",
+	"editEnabled":	true,
+	"iconFilename":	"AddInIcon.svg"
+}
