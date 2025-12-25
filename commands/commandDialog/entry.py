@@ -13,9 +13,6 @@ import adsk.core
 from ...lib import fusionAddInUtils as futil
 from ... import config
 
-app = adsk.core.Application.get()
-ui = app.userInterface
-
 CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_backup_project'
 CMD_NAME = 'Backup Project'
 CMD_DESCRIPTION = 'Backup all files from the active project'
@@ -28,24 +25,57 @@ PANEL_AFTER = 'Archive'
 
 ICON_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources', '')
 
+SUPPORTED_EXTENSIONS = {'f3d', 'f3z'}
+
 local_handlers = []
 
 
-def start():
-    """Register the command definition and add the button to the UI."""
+def _app():
+    return adsk.core.Application.get()
+
+
+def _ui():
+    return _app().userInterface
+
+
+def _ensure_command_definition():
+    ui = _ui()
     cmd_def = ui.commandDefinitions.itemById(CMD_ID)
     if not cmd_def:
         cmd_def = ui.commandDefinitions.addButtonDefinition(
             CMD_ID, CMD_NAME, CMD_DESCRIPTION, ICON_FOLDER
         )
+    return cmd_def
 
-    futil.add_handler(cmd_def.commandCreated, command_created)
 
+def _ensure_panel():
+    ui = _ui()
     workspace = ui.workspaces.itemById(WORKSPACE_ID)
     panel = workspace.toolbarPanels.itemById(PANEL_ID)
     if not panel:
         panel = workspace.toolbarPanels.add(PANEL_ID, PANEL_NAME, PANEL_AFTER, False)
+    return panel
 
+
+def _select_backup_folder():
+    ui = _ui()
+    folder_dialog = ui.createFolderDialog()
+    folder_dialog.title = 'Select a folder to save the backup'
+    if folder_dialog.showDialog() != adsk.core.DialogResults.DialogOK:
+        futil.log('Folder selection canceled.')
+        return None
+    backup_folder = folder_dialog.folder
+    if not os.path.exists(backup_folder):
+        os.makedirs(backup_folder)
+    return backup_folder
+
+
+def start():
+    """Create the command definition and add the toolbar button."""
+    cmd_def = _ensure_command_definition()
+    futil.add_handler(cmd_def.commandCreated, command_created)
+
+    panel = _ensure_panel()
     control = panel.controls.itemById(CMD_ID)
     if not control:
         control = panel.controls.addCommand(cmd_def)
@@ -55,7 +85,8 @@ def start():
 
 
 def stop():
-    """Remove the command UI elements and release local handlers."""
+    """Remove the command UI elements and clear handler references."""
+    ui = _ui()
     workspace = ui.workspaces.itemById(WORKSPACE_ID)
     panel = workspace.toolbarPanels.itemById(PANEL_ID)
     if panel:
@@ -75,7 +106,7 @@ def stop():
 
 
 def command_created(args: adsk.core.CommandCreatedEventArgs):
-    """Wire up command lifecycle events when the user activates the command."""
+    """Attach execute and destroy handlers when the command is created."""
     futil.log(f'{CMD_NAME} Command Created Event')
     futil.add_handler(args.command.execute, command_execute, local_handlers=local_handlers)
     futil.add_handler(args.command.destroy, command_destroy, local_handlers=local_handlers)
@@ -84,23 +115,19 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 def command_execute(args: adsk.core.CommandEventArgs):
     """Run the backup workflow after the user confirms the command."""
     try:
-        data = app.data
-        active_project = data.activeProject
+        app = _app()
+        ui = app.userInterface
+
+        active_project = app.data.activeProject
         if not active_project:
             ui.messageBox('Active project not found.')
             return
 
         futil.log(f'Active project identified: {active_project.name}')
 
-        folder_dialog = ui.createFolderDialog()
-        folder_dialog.title = 'Select a folder to save the backup'
-        if folder_dialog.showDialog() != adsk.core.DialogResults.DialogOK:
-            futil.log('Folder selection canceled.')
+        backup_folder = _select_backup_folder()
+        if not backup_folder:
             return
-
-        backup_folder = folder_dialog.folder
-        if not os.path.exists(backup_folder):
-            os.makedirs(backup_folder)
 
         futil.log(f'Backup folder selected: {backup_folder}')
 
@@ -116,7 +143,7 @@ def command_execute(args: adsk.core.CommandEventArgs):
 
 
 def command_destroy(args: adsk.core.CommandEventArgs):
-    """Release references to event handlers to avoid leaks."""
+    """Release handler references when the command terminates."""
     futil.log(f'{CMD_NAME} Command Destroy Event')
 
     global local_handlers
@@ -127,7 +154,6 @@ class BackupProcessor:
     def __init__(self, app, project, backup_path):
         self.app = app
         self.ui = app.userInterface
-        self.data = app.data
         self.documents = app.documents
         self.project = project
         self.backup_path = backup_path
@@ -187,13 +213,14 @@ class BackupProcessor:
         return files
 
     def _backup_file(self, data_file):
-        """Open, sanitize, and export a single Fusion data file."""
+        """Open a data file, export it, and close the document."""
         sanitized_name = sanitize_file_name(data_file.name)
-        if data_file.fileExtension.lower() not in ['f3d', 'f3z']:
+        file_ext = data_file.fileExtension.lower()
+        if file_ext not in SUPPORTED_EXTENSIONS:
             futil.log(f'Skipping unsupported file type: {sanitized_name}')
             return
 
-        relative_path = self._generate_backup_path(data_file)
+        relative_path = self._generate_backup_path(data_file, sanitized_name)
         target_path = os.path.join(self.backup_path, relative_path)
         target_dir = os.path.dirname(target_path)
 
@@ -221,10 +248,7 @@ class BackupProcessor:
                 os.makedirs(target_dir, exist_ok=True)
                 futil.log(f'Target directory created: {target_dir}')
 
-            if data_file.fileExtension.lower() == 'f3d':
-                self.app.executeTextCommand(f'data.fileExport f3d "{target_dir}"')
-            elif data_file.fileExtension.lower() == 'f3z':
-                self.app.executeTextCommand(f'data.fileExport f3z "{target_dir}"')
+            self._export_file(file_ext, target_dir)
 
             futil.log(f'File exported to: {target_dir}')
             futil.log(f'Backup completed successfully for file: {sanitized_name}')
@@ -239,9 +263,15 @@ class BackupProcessor:
                 document.close(False)
                 futil.log(f'Document closed for file: {sanitized_name}')
 
-    def _generate_backup_path(self, data_file):
-        """Compute the relative backup path using the project's folder structure."""
-        sanitized_name = sanitize_file_name(data_file.name)
+    def _export_file(self, file_ext, target_dir):
+        """Run the Fusion export command for the given extension."""
+        if file_ext == 'f3d':
+            self.app.executeTextCommand(f'data.fileExport f3d "{target_dir}"')
+        elif file_ext == 'f3z':
+            self.app.executeTextCommand(f'data.fileExport f3z "{target_dir}"')
+
+    def _generate_backup_path(self, data_file, sanitized_name):
+        """Build a relative backup path from the project folder tree."""
         current_folder = data_file.parentFolder
         folder_path = []
 
@@ -259,5 +289,5 @@ class BackupProcessor:
 
 
 def sanitize_file_name(file_name):
-    """Replace characters invalid in file paths with underscores."""
+    """Replace invalid path characters with underscores."""
     return re.sub(r'[\\/:;?!<>"|*]', '_', file_name)
