@@ -60,6 +60,84 @@ def project_key(project):
     return getattr(project, 'id', None) or project.name
 
 
+def _project_name(project):
+    try:
+        return project.name
+    except Exception:
+        return '<unknown project>'
+
+
+def _project_from_folder(folder):
+    current_folder = folder
+    while current_folder:
+        try:
+            project = current_folder.parentProject
+            if project:
+                return project
+        except Exception:
+            pass
+
+        try:
+            if current_folder.isRoot:
+                break
+        except Exception:
+            break
+
+        try:
+            current_folder = current_folder.parentFolder
+        except Exception:
+            break
+
+    return None
+
+
+def get_active_project_safe(app):
+    """Resolve project without trusting app.data.activeProject blindly."""
+    try:
+        project = app.data.activeProject
+        if project:
+            futil.log(f'Active project from app.data.activeProject: {_project_name(project)}')
+            return project
+    except Exception as ex:
+        futil.log(f'app.data.activeProject failed: {ex}')
+
+    try:
+        document = app.activeDocument
+    except Exception as ex:
+        futil.log(f'app.activeDocument failed: {ex}')
+        document = None
+
+    if not document:
+        return None
+
+    try:
+        data_file = document.dataFile
+    except Exception as ex:
+        futil.log(f'activeDocument.dataFile failed: {ex}')
+        data_file = None
+
+    if not data_file:
+        return None
+
+    try:
+        project = data_file.parentProject
+        if project:
+            futil.log(f'Active project from active document: {_project_name(project)}')
+            return project
+    except Exception as ex:
+        futil.log(f'activeDocument.dataFile.parentProject failed: {ex}')
+
+    try:
+        project = _project_from_folder(data_file.parentFolder)
+        if project:
+            futil.log(f'Active project from active document folder: {_project_name(project)}')
+            return project
+    except Exception as ex:
+        futil.log(f'activeDocument.dataFile.parentFolder failed: {ex}')
+
+    return None
+
+
 def _ensure_command_definition():
     ui = _ui()
     cmd_def = ui.commandDefinitions.itemById(CMD_ID)
@@ -305,9 +383,14 @@ def command_execute(args: adsk.core.CommandEventArgs):
         app = _app()
         ui = app.userInterface
 
-        active_project = app.data.activeProject
+        active_project = get_active_project_safe(app)
         if not active_project:
-            ui.messageBox('Active project not found.')
+            ui.messageBox(
+                'Active project not found.\n\n'
+                'Open any saved design from the target project, wait until it loads, '
+                'then run Backup Project again.\n\n'
+                'Fusion failed to provide a valid Data Project context.'
+            )
             return
 
         backup_folder = _select_backup_folder()
@@ -485,7 +568,12 @@ class BackupProcessor:
         self.manifest.ensure_project(self.project_key, self.project.name, self.project_dir)
 
         tasks = []
-        data_files = self._collect_files(self.project.rootFolder)
+        try:
+            root_folder = self.project.rootFolder
+        except Exception as ex:
+            raise RuntimeError(f'Failed to access project root folder: {ex}') from ex
+
+        data_files = self._collect_files(root_folder)
         for data_file in data_files:
             file_ext = data_file.fileExtension.lower()
             if file_ext not in SUPPORTED_EXTENSIONS:
@@ -630,7 +718,13 @@ class BackupProcessor:
     def _try_step_export(self, document, file_ext, target_dir, display_name):
         """Export STEP if the opened document exposes a Fusion design."""
         try:
-            design = adsk.fusion.Design.cast(self.app.activeProduct)
+            try:
+                product = self.app.activeProduct
+            except Exception as ex:
+                futil.log(f'activeProduct failed for {display_name}: {ex}')
+                return False
+
+            design = adsk.fusion.Design.cast(product)
             if not design:
                 futil.log(f'Not a Design document, STEP skipped: {display_name}')
                 return True
